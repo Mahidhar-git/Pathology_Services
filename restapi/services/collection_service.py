@@ -4,6 +4,7 @@ import requests
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
+from restapi.models.collection import Collection, CollectionTest
 
 from restapi.constants.order_status import (
     TestStatus,
@@ -82,6 +83,7 @@ def get_invoice_item(
         f"invoice_item_id={invoice_item_id} "
         f"or test_service_id={test_service_id}"
     )
+
 def resolve_test_from_service_id(service_id: int):
     from restapi.models.test_test import Test
     try:
@@ -121,148 +123,70 @@ def generate_collection_identifiers() -> dict:
 
 
 @transaction.atomic
-def create_collection(**validated_data) -> Collection:
+def create_collection(
+    collection_date,
+    collection_time,
+    tests: list,
+) -> Collection:
 
     identifiers = generate_collection_identifiers()
 
-    work_order_id = validated_data.get("work_order_id")
-    test_service_id = validated_data.get("test_service_id")
-
-    if not work_order_id:
-        raise ValueError("work_order_id is required")
-
-    if not test_service_id:
-        raise ValueError("test_service_id is required")
-    
-    invoice_item_id = validated_data.get("invoice_item_id")
-
-    # Duplicate protection
-    existing = Collection.objects.filter(
-        work_order_id=work_order_id,
-        invoice_item_id=invoice_item_id,
-    ).first() if invoice_item_id else None
-
-    if existing:
-        return existing
-
-    # -----------------------------------
-    # Fetch full order details from Vidai
-    # -----------------------------------
-
-    order_data = fetch_vidai_order_detail(work_order_id)
-
-    patient = order_data.get("patient", {})
-
-    invoice_item = get_invoice_item(
-        order_data,
-        invoice_item_id=validated_data.get("invoice_item_id"),
-        test_service_id=test_service_id,
-    )
-
-    # -----------------------------------
-    # Order-level fields
-    # -----------------------------------
-
-    validated_data["bill_number"] = order_data.get("bill_number")
-    validated_data["bill_type"] = order_data.get("bill_type")
-    validated_data["visit_id"] = order_data.get("visit_id")
-    validated_data["visit_date"] = order_data.get("visit_date")
-
-    # -----------------------------------
-    # Patient-level fields
-    # -----------------------------------
-
-    validated_data["patient_name"] = patient.get("name")
-    validated_data["patient_mrn"] = patient.get("mrn")
-    validated_data["patient_age"] = patient.get("age")
-    validated_data["patient_gender"] = patient.get("gender")
-    validated_data["patient_type"] = patient.get("patient_type")
-    validated_data["cycle_number"] = patient.get("cycle_number")
-
-    first_name = patient.get("doctor_first_name", "") or ""
-    last_name = patient.get("doctor_last_name", "") or ""
-
-    validated_data["doctor_name"] = (
-        f"{first_name} {last_name}"
-    ).strip()
-
-    # -----------------------------------
-    # Invoice-item fields
-    # -----------------------------------
-
-    validated_data["invoice_item_id"] = invoice_item.get("id")
-
-    validated_data["billing_source_type"] = (
-        invoice_item.get("billing_source_type")
-    )
-
-    validated_data["billing_source_id"] = (
-        invoice_item.get("billing_source_id")
-    )
-
-    validated_data["billing_source_code"] = (
-        invoice_item.get("billing_source_code")
-    )
-
-    validated_data["billing_source_name"] = (
-        invoice_item.get("billing_source_name")
-    )
-
-    validated_data["test_service_code"] = (
-        invoice_item.get("test_service_code")
-    )
-
-    validated_data["test_service_name"] = (
-        invoice_item.get("test_service_name")
-    )
-
-    validated_data["charges"] = (
-        invoice_item.get("charges")
-    )
-
-    validated_data["net_amount"] = (
-        invoice_item.get("net_amount")
-    )
-
-    validated_data["is_from_package"] = (
-        invoice_item.get("is_from_package", False)
-    )
-
-    validated_data["is_refunded"] = (
-        invoice_item.get("is_refunded", False)
-    )
-
-    # -----------------------------------
-    # Resolve local test
-    # -----------------------------------
-
-    if validated_data.get("test") is None:
-
-        test = resolve_test_from_service_id(
-            validated_data["test_service_id"]
-        )
-
-        if test:
-            validated_data["test"] = test
-
-            # Auto-resolve sample from test master
-            if validated_data.get("sample") is None:
-                test_sample = test.test_samples.filter(
-                    is_deleted=False
-                ).first()
-                if test_sample:
-                    validated_data["sample"] = test_sample.sample
-
-    # -----------------------------------
-    # Create collection
-    # -----------------------------------
-
     collection = Collection.objects.create(
-        **validated_data,
+        collection_date=collection_date,
+        collection_time=collection_time,
         status=TestStatus.COLLECTED,
         barcode_value=identifiers["barcode_value"],
         specimen_no=identifiers["specimen_no"],
     )
+
+    for test_data in tests:
+        work_order_id = test_data.get("work_order_id")
+        invoice_item_id = test_data.get("invoice_item_id")
+        test_service_id = test_data.get("test_service_id")
+
+        # Duplicate protection
+        existing = CollectionTest.objects.filter(
+            work_order_id=work_order_id,
+            invoice_item_id=invoice_item_id,
+        ).first()
+
+        if existing:
+            continue
+
+        # Resolve test from config
+        test = resolve_test_from_service_id(test_service_id)
+
+        # Resolve sample from test
+        sample = None
+        if test:
+            test_sample = test.test_samples.filter(
+                is_deleted=False
+            ).first()
+            if test_sample:
+                sample = test_sample.sample
+
+        # Resolve agency if outsource
+        agency = None
+        agency_id = test_data.get("agency")
+        if agency_id:
+            from restapi.models.agency import Agency
+            try:
+                agency = Agency.objects.get(id=agency_id)
+            except Agency.DoesNotExist:
+                pass
+
+        CollectionTest.objects.create(
+            collection=collection,
+            work_order_id=work_order_id,
+            patient_id=test_data.get("patient_id"),
+            invoice_item_id=invoice_item_id,
+            test_service_id=test_service_id,
+            test=test,
+            sample=sample,
+            agency=agency,
+            test_type=test_data.get("test_type", TestType.INHOUSE),
+            status=TestStatus.COLLECTED,
+        )
 
     return collection
 

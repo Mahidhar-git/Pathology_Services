@@ -18,4 +18,4 @@ from .patient import Patient
 from .shipment import ScheduleShipping
 from .receive_model import ReceiveSample
 from .result_entry_model import ResultEntry
-from .collection import Collection
+from .collection import Collection, CollectionTest

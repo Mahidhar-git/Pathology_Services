@@ -2921,6 +2921,7 @@ from restapi.selectors.collection_selector import (
 from restapi.serializers.collection_serializer import (
     ChangeCollectionAgencySerializer,
     CollectionSerializer,
+    CreateCollectionSerializer,
     GenerateCollectionBarcodeSerializer,
     UpdateCollectionStatusSerializer,
 )
@@ -3039,15 +3040,19 @@ class CollectionListCreateView(APIView):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     def post(self, request):
-        serializer = CollectionSerializer(data=request.data)
+        serializer = CreateCollectionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        collection = create_collection(**serializer.validated_data)
+        collection = create_collection(
+            collection_date=serializer.validated_data["collection_date"],
+            collection_time=serializer.validated_data["collection_time"],
+            tests=serializer.validated_data["tests"],
+    )
 
         return Response(
             CollectionSerializer(collection).data,
             status=status.HTTP_201_CREATED,
-        )
+    )
 
 
 class CollectionDetailView(APIView):
